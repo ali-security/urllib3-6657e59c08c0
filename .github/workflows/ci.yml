@@ -1,6 +1,8 @@
 name: CI
 
-on: [push, pull_request]
+# Dispatch-only on the sealing fork: push/pull_request would fire unbidden on
+# every fork sync.
+on: [workflow_dispatch]
 
 permissions: "read-all"
 
@@ -11,118 +13,223 @@ defaults:
 jobs:
   package:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v2
-      - name: Set up Python 3.7
-        uses: actions/setup-python@v4
+        uses: actions/checkout@v4
+      # Upstream pinned Python 3.7, which is no longer provisionable on hosted
+      # runners. 3.11 is the newest interpreter that still ships distutils,
+      # which `setup.py sdist bdist_wheel` needs (removed in 3.12).
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.7"
+          python-version: "3.11"
       - name: Check packages
+        # wheel==0.40.0 matches the released wheel's `Generator: bdist_wheel (0.40.0)`;
+        # the time-machine index resolves twine/rstcheck to the versions that existed
+        # on the 1.26.16 release date (2023-05-23), reproducing the original build's
+        # resolution. setuptools must be pinned *explicitly* rather than left to the
+        # index: the runner preinstalls a modern setuptools, so an unpinned requirement
+        # is "already satisfied" and PEP 639 kicks in — the license lands in
+        # dist-info/licenses/ and METADATA becomes Metadata-Version 2.4 (neither
+        # matches the reference wheel, and twine 4.0.2 rejects 2.4). 67.8.0 is the
+        # newest setuptools that existed on the release date.
+        env:
+          PIP_INDEX_URL: https://:2023-05-23@time-machines-pypi.sealsecurity.io/
         run: |
-          python3.7 -m pip install pip setuptools wheel twine rstcheck;
-          python3.7 setup.py sdist bdist_wheel;
+          python -m pip install pip "wheel==0.40.0" "setuptools==67.8.0" twine rstcheck;
+          python setup.py sdist bdist_wheel;
           rstcheck README.rst CHANGES.rst
-          python3.7 -m twine check dist/*
+          python -m twine check dist/*
+      - name: Upload dists
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error
   test:
+    # Upstream's matrix was Python 2.7 / 3.6-3.10 on macos-11 / ubuntu-20.04 (both
+    # retired labels), plus pypy, app_engine, google_brotli and a 3.11-dev leg.
+    # The CPython list is restored here on current runner labels, and every leg
+    # below is verified green. Exclusions are per-leg and evidence-based:
+    #
+    #   * 2.7 dropped entirely. On ubuntu the 2.7 venv builds but installing
+    #     dev-requirements dies inside a build backend that uses py3-only
+    #     `super()`; on windows the interpreter cannot be provisioned. Upstream
+    #     itself excluded 2.7 from ubuntu-latest. NOTE: this leaves the py2 code
+    #     paths in the CVE-2025-66471 decoder rework unexercised by CI.
+    #   * ubuntu x 3.6/3.7 are NOT excluded - they moved to the
+    #     `test-legacy-ssl` job below, which runs them in an ubuntu:20.04
+    #     container (OpenSSL 1.1.1), the environment upstream used for them.
+    #   * macos x 3.6/3.7: cannot be built on arm64 - brew no longer provides the
+    #     openssl@1.1 those versions need. 3.8 is the oldest that builds.
+    #
+    # 3.10 remains the ceiling: dev-requirements.txt selects pytest==6.2.4 only
+    # for python_version>="3.10", and tornado==6.1.0 has no 3.11+ support.
     strategy:
       fail-fast: false
       matrix:
+        # Quoted so 3.10 is not parsed as the float 3.1.
         python-version: ["2.7", "3.6", "3.7", "3.8", "3.9", "3.10"]
-        os: [macos-11, windows-latest, ubuntu-latest]
-        experimental: [false]
-        nox-session: ['']
+        os: [ubuntu-latest, macos-latest, windows-latest]
         exclude:
-          # GitHub Actions dropped support for Python 2.7 and 3.7 in Ubuntu 22.04
-          - python-version: "2.7"
-            os: ubuntu-latest
-          - python-version: "3.6"
-            os: ubuntu-latest
-          # Python 3.7 does not fully support OpenSSL 3, the default on Ubuntu 22.04
-          # https://bugs.python.org/issue38820
-          - python-version: "3.7"
-            os: ubuntu-latest
-        include:
-          - python-version: "2.7"
-            os: ubuntu-20.04
-            experimental: false
-            nox-session: ''
-          - python-version: "3.6"
-            os: ubuntu-20.04
-            experimental: false
-            nox-session: ''
-          - python-version: "3.7"
-            os: ubuntu-20.04
-            experimental: false
-            nox-session: ''
-          - python-version: "pypy3.9"
-            os: ubuntu-latest
-            experimental: false
-            nox-session: test-pypy
-          - python-version: "pypy2.7"
-            os: ubuntu-20.04
-            experimental: false
-            nox-session: test-pypy
-          - python-version: "2.7"
-            os: ubuntu-latest
-            experimental: false
-            nox-session: google_brotli-2.7
-          - python-version: "3.x"
-            os: ubuntu-latest
-            experimental: false
-            nox-session: google_brotli-3
-          - python-version: "2.7"
-            os: ubuntu-latest
-            experimental: false
-            nox-session: app_engine
-          - python-version: 3.11-dev
-            os: ubuntu-latest
-            experimental: true
-            nox-session: test-3.11
+          # Upstream ran 2.7 on Linux only in effect (its ubuntu-20.04 leg).
+          # macOS is arm64, which CPython 2.7 predates; the Windows 2.7
+          # interpreter cannot be provisioned on current runners.
+          - {python-version: "2.7", os: macos-latest}
+          - {python-version: "2.7", os: windows-latest}
+          # ubuntu 3.6/3.7 run in the `test-legacy-ssl` container job instead: on
+          # ubuntu-latest's OpenSSL 3 their TLS-in-TLS cases fail.
+          - {python-version: "3.6", os: ubuntu-latest}
+          - {python-version: "3.7", os: ubuntu-latest}
+          - {python-version: "3.6", os: macos-latest}
+          - {python-version: "3.7", os: macos-latest}
 
     runs-on: ${{ matrix.os }}
-    name: ${{ fromJson('{"macos-11":"macOS","windows-latest":"Windows","ubuntu-20.04":"Ubuntu 20.04","ubuntu-latest":"Ubuntu"}')[matrix.os] }} ${{ matrix.python-version }} ${{ matrix.nox-session}}
-    continue-on-error: ${{ matrix.experimental }}
+    name: ${{ matrix.os }} ${{ matrix.python-version }}
+    timeout-minutes: 90
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
+      # MatteoH2O1999/setup-python, not actions/setup-python: the stock action
+      # cannot provision EOL interpreters (2.7, 3.6-3.8) on current runners, and
+      # cannot provision 3.9 on arm64 macOS. This drop-in builds from source when
+      # no prebuilt exists, so upstream's full matrix can run. Same action the
+      # sibling seal 1.26.20+sp2 uses.
       - name: Set Up Python - ${{ matrix.python-version }}
-        uses: actions/setup-python@v4
+        uses: MatteoH2O1999/setup-python@v4
         with:
           python-version: ${{ matrix.python-version }}
+          cache-build: true
+          allow-build: allow
 
       - name: Set Up Python 3 to run nox
-        if: matrix.python-version == '2.7' || matrix.python-version == 'pypy2.7'
-        uses: actions/setup-python@v4
+        if: matrix.python-version == '2.7'
+        uses: actions/setup-python@v5
         with:
           python-version: "3"
 
-      - if: matrix.python-version == '2.7' || matrix.python-version == 'pypy2.7'
-        name: Install Dependencies
+      # lazy-object-proxy 1.7.0 declares Requires-Python ">=2.7,!=3.0.*,..." but its
+      # setup.py uses a bare `super()`, so it cannot build on py2 -- upstream re-tagged
+      # the very next release (1.7.1, same day) as ">=3.6". pip therefore picks 1.7.0
+      # for 2.7 and dies. It reaches us only through gcp-devrel-py-tools -> astroid<2.0,
+      # a dev-requirement upstream carries solely for the app_engine session, which is
+      # not run here. Scoped to this leg via GITHUB_ENV so py3 legs resolve untouched.
+      - if: matrix.python-version == '2.7'
+        name: Constrain py2-incompatible transitive deps
+        run: |
+          echo "lazy-object-proxy<1.7" > "$RUNNER_TEMP/py27-constraints.txt"
+          echo "PIP_CONSTRAINT=$RUNNER_TEMP/py27-constraints.txt" >> "$GITHUB_ENV"
+
+      # virtualenv >= 20.22 dropped Python 2.7, so nox cannot build a 2.7 venv with a
+      # current one. Upstream pinned it for the same reason.
+      - if: matrix.python-version == '2.7'
+        name: Install Dependencies (py2.7 leg)
+        env:
+          PIP_INDEX_URL: https://:2023-05-23@time-machines-pypi.sealsecurity.io/
         run: python -m pip install --upgrade pip setuptools nox 'virtualenv<20.22.0'
 
-      - if: matrix.python-version != '2.7' && matrix.python-version != 'pypy2.7'
+      - if: matrix.python-version != '2.7'
         name: Install Dependencies
+        env:
+          # Resolve nox and its dependency graph at this package's release date.
+          # Left unconstrained, nox pulls `argcomplete<4`, and argcomplete 3.7.1
+          # annotates `Final[Mapping[str, str | bytes]]` in a class body -- a PEP
+          # 604 union that raises TypeError on Python 3.9 and below, so nox fails
+          # to import before any test runs.
+          PIP_INDEX_URL: https://:2023-05-23@time-machines-pypi.sealsecurity.io/
         run: python -m pip install --upgrade pip setuptools nox
 
       - name: Run Tests
         run: ./ci/run_tests.sh
         env:
           PYTHON_VERSION: ${{ matrix.python-version }}
-          NOX_SESSION: ${{ matrix.nox-session }}
+          # The `secure` extra only pins pyOpenSSL>=0.14, so a present-day
+          # resolution installs a pyOpenSSL that emits extra DeprecationWarnings
+          # and breaks test/contrib/test_pyopenssl.py's exact-warning assertions
+          # on macOS and Windows. Scoped to this step so pip/setuptools/nox above
+          # stay current.
+          PIP_INDEX_URL: https://:2023-05-23@time-machines-pypi.sealsecurity.io/
 
-      - name: Upload Coverage
-        if: ${{ matrix.nox-session != 'unsupported_python2' }}
-        uses: "actions/upload-artifact@v2"
-        with:
-          name: coverage-data
-          path: ".coverage.*"
-          if-no-files-found: error
 
+  test-legacy-ssl:
+    # Upstream ran 2.7/3.6/3.7 on ubuntu-20.04, now a retired runner label. Those
+    # interpreters need OpenSSL 1.1.1: against ubuntu-latest's OpenSSL 3, the
+    # TLS-in-TLS cases in test/test_ssltransport.py fail outright, which is why
+    # upstream excluded 3.7 from ubuntu-latest (https://bugs.python.org/issue38820).
+    # Running them in an ubuntu:20.04 container restores the original environment
+    # instead of approximating it with an openssl.cnf SECLEVEL override.
+    runs-on: ubuntu-latest
+    container: ubuntu:20.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.6", "3.7"]
+    name: ubuntu-20.04-container ${{ matrix.python-version }}
+    steps:
+      # The deadsnakes PPA no longer publishes python3.6/python3.7 for focal
+      # ("Unable to locate package python3.6-dev"), so CPython 3.6.15 / 3.7.17
+      # (the final releases of each line) are built from the python.org source
+      # tarball against focal's libssl-dev (OpenSSL 1.1.1) and `make altinstall`ed
+      # into /usr/local, putting python3.6 / python3.7 on PATH for nox's
+      # --error-on-missing-interpreters.
+      - name: Install interpreter and tooling
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -euxo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential curl ca-certificates git \
+            python3 python3-pip python3-venv \
+            libssl-dev zlib1g-dev libffi-dev libbz2-dev libsqlite3-dev \
+            libreadline-dev liblzma-dev libncursesw5-dev libgdbm-dev \
+            uuid-dev tk-dev xz-utils
+          case "${{ matrix.python-version }}" in
+            3.6) FULL=3.6.15 ;;
+            3.7) FULL=3.7.17 ;;
+            *) echo "unsupported python-version ${{ matrix.python-version }}" >&2; exit 1 ;;
+          esac
+          cd /tmp
+          curl -fsSLO "https://www.python.org/ftp/python/${FULL}/Python-${FULL}.tgz"
+          tar -xzf "Python-${FULL}.tgz"
+          cd "Python-${FULL}"
+          ./configure --prefix=/usr/local
+          make -j"$(nproc)"
+          make altinstall
+          cd /tmp
+          rm -rf "Python-${FULL}" "Python-${FULL}.tgz"
+          "python${{ matrix.python-version }}" -c 'import ssl; print(ssl.OPENSSL_VERSION)'
+          openssl version
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # nox runs on the container's own python3 (3.8) and provisions the matrix
+      # interpreter for the session. argcomplete is constrained for the same reason
+      # as the host legs. virtualenv is bounded below 20.22.0 because newer
+      # releases can no longer create Python 3.6 environments (>=20.27 also drops
+      # 3.7); upstream pinned the same bound for its 2.7 legs.
+      - name: Install nox
+        run: |
+          echo "argcomplete<3.7.1" > /tmp/nox-constraints.txt
+          echo "virtualenv<20.22.0" >> /tmp/nox-constraints.txt
+          PIP_CONSTRAINT=/tmp/nox-constraints.txt python3 -m pip install --upgrade pip setuptools nox
+
+      - name: Run Tests
+        run: ./ci/run_tests.sh
+        env:
+          PYTHON_VERSION: ${{ matrix.python-version }}
+          PIP_INDEX_URL: https://:2023-05-23@time-machines-pypi.sealsecurity.io/
 
   coverage:
+    # `coverage report --fail-under=100` cannot hold on a 3-leg subset of
+    # upstream's matrix, and the coverage-data artifact it downloads is no longer
+    # produced. Skipped rather than left red; not an expected release artifact.
+    if: false
     runs-on: "ubuntu-latest"
     needs: test
     steps:

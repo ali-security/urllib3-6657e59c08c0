@@ -1,6 +1,8 @@
 name: lint
 
-on: [push, pull_request]
+# Dispatch-only on the sealing fork: not part of the build, and its retired
+# ubuntu-20.04 label would queue forever if a push fired it.
+on: [workflow_dispatch]
 
 permissions: "read-all"
 
